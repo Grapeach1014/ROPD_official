@@ -1,0 +1,92 @@
+# Local secrets / runtime
+.env
+.venv
+.venv/
+ENV/
+venv/
+.python-version
+
+# Caches
+.cache/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.tmp/
+.ray_tmp/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Coverage / tests
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+output.txt
+
+# Logs / artifacts / outputs
+**/logs
+**/log
+**/outputs
+**/checkpoints
+**/wget-log
+**/_build/
+**/*.ckpt
+**/*.pt
+**/*.tar.gz
+**/playground
+
+# W&B / SwanLab
+**/wandb
+!/wandb/
+/wandb/*
+!/wandb/wandb.env.example
+!/swanlab/
+/swanlab/*
+
+# Editor / OS
+.claude/
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# Project data (large)
+*.parquet
+/models/
+/datasets/unified/
+/datasets/unified/*
+!/datasets/unified/math_eval/
+/datasets/unified/math_eval/*
+!/datasets/unified/math_eval/aime24/
+!/datasets/unified/math_eval/aime25/
+!/datasets/unified/math_eval/math500/
+!/datasets/unified/math_eval/amc23/
+
+# Misc
+*.lock
+*.bak
+*.bak2
+*.[Pp][Dd][Ff]
+.history

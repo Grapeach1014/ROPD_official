@@ -1,0 +1,220 @@
+# @package _global_
+#
+# ROPD trainer config (single runnable entry point).
+#
+# Default workflow:
+# 1. Set OPENAI_API_KEY (and OPENAI_BASE_URL if you use a non-OpenAI gateway)
+#    so the rubricator + verifier can hit an OpenAI-compatible endpoint.
+# 2. Build a teacher index for your training set (see README "Teacher index").
+# 3. Run `bash training/train.sh`, which calls
+#    `python -m verl.trainer.main_ppo --config-name ropd`.
+#
+# Key environment variables this config reads:
+#   DATA_ROOT                       parquet dataset root (default datasets/unified)
+#   ROPD_TRAIN_TASK            training task path (default math/dapo-math-17k)
+#   ROPD_VAL_TASK              validation task path (default math_eval/aime24)
+#   ROPD_MODEL_PATH            policy / actor model checkpoint
+#   ROPD_CKPT_DIR              checkpoint output root
+#   ROPD_TEACHER_INDEX_PATH    offline teacher answer index (jsonl)
+#   OPENAI_API_KEY / OPENAI_BASE_URL  cloud judge credentials (used by judge_providers.yaml)
+#   ROPD_RUBRICATOR_MODEL      override rubricator model (default gpt-5.2-chat-latest)
+#   ROPD_VERIFIER_MODEL        override verifier model   (default gpt-5.2-chat-latest)
+#   ROPD_TEACHER_MODEL         override teacher model    (default gpt-5.2-chat-latest)
+#
+# To switch to a self-hosted vLLM judge, flip rubricator / verifier `profile`
+# in verl/trainer/config/judge_providers.yaml from `openai_default` to
+# `local_vllm`, then start the server with `bash training/launch_judge_vllm.sh`.
+
+defaults:
+  - /baseline_grpo
+  - _self_
+
+max_model_len: 10240
+
+vars:
+  dir: ${oc.env:DATA_ROOT,datasets/unified}
+  train_task: ${oc.env:ROPD_TRAIN_TASK,math/dapo-math-17k}
+  val_task: ${oc.env:ROPD_VAL_TASK,math_eval/aime24}
+  log_dir: outputs
+  ckpt_dir: ${oc.env:ROPD_CKPT_DIR,${ropd_ckpt_dir:}}
+
+custom_reward_function:
+  path: null
+  name: compute_score
+
+data:
+  train_files:
+    - ${vars.dir}/${vars.train_task}/train.parquet
+  val_files:
+    - ${vars.dir}/${vars.val_task}/test.parquet
+  train_max_samples: -1
+  val_max_samples: -1
+  train_batch_size: 32
+  val_batch_size: null
+  max_prompt_length: 2048
+  max_response_length: 8192
+  filter_overlong_prompts: True
+  trust_remote_code: True
+  validation_shuffle: False
+
+# Reward manager is loaded dynamically from this repo via importlib so the
+# implementation lives next to the algorithm code, not inside verl.
+reward_manager:
+  source: importlib
+  name: RopdRewardManager
+  module:
+    path: algo/ropd/reward_manager.py
+    name: ropd_reward_manager
+
+# Validation (e.g. AIME24) only checks final-answer correctness against the
+# ground truth, so it does not need the rubric / verifier loop.
+val_reward_manager:
+  source: register
+  name: naive
+
+actor_rollout_ref:
+  checkpoint_engine: ${oc.select:async_training.checkpoint_engine, null}
+  actor:
+    ppo_micro_batch_size_per_gpu: 2
+    ppo_mini_batch_size: 8
+    use_kl_loss: False
+    optim:
+      lr: 1e-6
+      lr_warmup_steps_ratio: 0.0
+      weight_decay: 0.01
+      lr_warmup_steps: -1
+      lr_scheduler_type: constant
+  model:
+    path: ${oc.env:ROPD_MODEL_PATH,models/Qwen3-4B}
+    override_config:
+      attn_implementation: sdpa
+    trust_remote_code: True
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+  rollout:
+    name: ${oc.env:ROLLOUT_NAME,vllm}
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.60
+    max_num_batched_tokens: 131072
+    max_model_len: ${max_model_len}
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    log_prob_micro_batch_size_per_gpu: 1
+    n: 8
+    temperature: 1.0
+    top_p: null
+    enforce_eager: false
+    val_kwargs:
+      n: 8
+      do_sample: True
+      temperature: 1.0
+      top_p: null
+
+critic:
+  enable: False
+  model:
+    path: ${actor_rollout_ref.model.path}
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: False
+  use_kl_in_reward: False
+
+async_training:
+  staleness_threshold: 0.0
+  trigger_parameter_sync_step: 1
+  require_batches: 1
+  partial_rollout: false
+  use_rollout_log_probs: true
+  compute_prox_log_prob: false
+  use_trainer_do_validate: false
+  checkpoint_engine:
+    enable: true
+    device_buffer_size_M: 4096
+    overlap_broadcast_and_consume: false
+
+# Strict-async runs the judge / rubric loop in parallel with rollout. `sync`
+# is the safest default; switch to `strict_async` once your judge is stable.
+ropd_execution:
+  mode: sync
+  strict_async:
+    target_group_count: ${data.train_batch_size}
+    raw_group_queue_size: 128
+    scored_group_queue_size: 128
+    judge_worker_count: 4
+    resource_pool_mode: shared
+    admission_block_timeout_seconds: 300
+    fail_policy: stop
+
+rollout:
+  nnodes: ${trainer.nnodes}
+  n_gpus_per_node: ${trainer.n_gpus_per_node}
+  n: ${actor_rollout_ref.rollout.n}
+  total_rollout_steps: 0
+  total_epochs: ${trainer.total_epochs}
+  test_freq: ${trainer.test_freq}
+
+reward_model:
+  use_reward_loop: False
+  launch_reward_fn_async: False
+  val_reward_kwargs: {}
+  reward_kwargs:
+    ropd:
+      teacher_answer_count: ${oc.decode:${oc.env:ROPD_TEACHER_ANSWER_COUNT,4}}
+      max_concurrency: 4
+      extra_rubric_instructions: ""
+      extra_scoring_instructions: ""
+      provider_resolution:
+        spec_path: verl/trainer/config/judge_providers.yaml
+        entrypoint: train
+        overrides:
+          global: {}
+          teacher:
+            timeout_seconds: 480
+          rubricator:
+            timeout_seconds: 120
+            max_output_tokens: ${oc.decode:${oc.env:ROPD_RUBRICATOR_MAX_OUTPUT_TOKENS,8192}}
+          verifier:
+            timeout_seconds: 60
+            max_output_tokens: ${oc.decode:${oc.env:ROPD_VERIFIER_MAX_OUTPUT_TOKENS,4096}}
+      reward_quality_gate:
+        enabled: true
+        max_fallback_rate: 0.4
+        max_retry_rounds: 1
+        retry_pair_concurrency: 1
+        max_step_judge_retry_attempts: 2
+        step_judge_retry_initial_backoff_seconds: 1.0
+        step_judge_retry_backoff_multiplier: 2.0
+        step_judge_retry_max_backoff_seconds: 4.0
+      transport:
+        max_retries: 2
+        initial_backoff_seconds: 1.0
+        backoff_multiplier: 2.0
+        max_backoff_seconds: 8.0
+        max_in_flight_requests: 32
+      provider_limits:
+        max_concurrent_requests: 32
+        max_rpm: 1920
+        max_tpm: 6000000
+      request_scheduler:
+        enabled: true
+        num_workers: null
+        max_queue_size: null
+        stage_priority_enabled: true
+        record_queue_metrics: true
+
+trainer:
+  project_name: ROPD
+  group_name: ${oc.env:EXPERIMENT,ropd}
+  experiment_name: ${oc.env:EXPERIMENT,ropd}
+  logger: ["console", "wandb"]
+  total_epochs: 1
+  total_training_steps: 500
+  val_before_train: False
+  val_only: False
+  test_freq: -1
+  save_freq: 100
+  default_local_dir: ${vars.ckpt_dir}/${trainer.experiment_name}
+  n_gpus_per_node: 1
+  nnodes: 1
+  max_actor_ckpt_to_keep: 3
