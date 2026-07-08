@@ -20,6 +20,7 @@ from algo.ropd.client import (
 )
 from algo.ropd_clients import BlackOPDClientError, BlackOPDStructuredRubric
 from algo.ropd_pipeline import BlackOPDGroup, BlackOPDRollout, canonicalize_raw_prompt, normalize_raw_prompt
+from algo.ropd_teacher_index import BlackOPDTeacherIndexError
 from verl.protocol import DataProto
 from verl.workers.reward_manager.abstract import AbstractRewardManager, RawRewardFn
 
@@ -398,6 +399,16 @@ class RopdRewardManager(AbstractRewardManager):
                 error_type=exc.error_type,
                 error_stage=exc.stage,
                 error_details=error_details,
+            )
+        except BlackOPDTeacherIndexError as exc:
+            return RopdGroupResult(
+                student_scores=tuple(0.0 for _ in group.rollouts),
+                reward_scores=tuple(0.0 for _ in group.rollouts),
+                judge_error=True,
+                fallback_used=True,
+                error_type="teacher_index_error",
+                error_stage="teacher",
+                error_details={"message": str(exc)},
             )
         except Exception as exc:
             return RopdGroupResult(

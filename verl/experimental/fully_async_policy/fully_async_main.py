@@ -25,8 +25,10 @@ import ray
 from omegaconf import OmegaConf
 
 from verl.experimental.fully_async_policy.ropd_judge_worker import BlackOPDJudgeWorker
-from verl.experimental.fully_async_policy.ropd_queue import BoundedGroupQueue
-from verl.experimental.fully_async_policy.ropd_window_coordinator import WindowCoordinator
+from verl.experimental.fully_async_policy.black_opd_queue import BoundedGroupQueue
+#from verl.experimental.fully_async_policy.ropd_queue import BoundedGroupQueue
+from verl.experimental.fully_async_policy.black_opd_window_coordinator import WindowCoordinator
+#from verl.experimental.fully_async_policy.ropd_window_coordinator import WindowCoordinator
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient

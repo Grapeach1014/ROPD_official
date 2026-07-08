@@ -28,6 +28,37 @@ profiles:
         rubricator: {}
         verifier: {}
 
+  # Anthropic SDK endpoint (e.g. Claude via the Compass gateway).
+  # Set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL directly, or set
+  # ANTHROPIC_PROFILE=COMPASS with ANTHROPIC_COMPASS_AUTH_TOKEN /
+  # ANTHROPIC_COMPASS_BASE_URL.
+  claude_compass:
+    provider: anthropic
+    backend: anthropic
+    api_key_env: ANTHROPIC_AUTH_TOKEN
+    base_url_env: ANTHROPIC_BASE_URL
+    default_api_style: anthropic_messages
+    transport:
+      max_retries: 2
+      initial_backoff_seconds: 1.0
+      backoff_multiplier: 2.0
+      max_backoff_seconds: 8.0
+      max_in_flight_requests: 16
+    provider_limits:
+      max_concurrent_requests: 16
+      max_rpm: 600
+      max_tpm: 1000000
+      circuit_breaker:
+        consecutive_retriable_errors: 5
+        rolling_window_size: 20
+        rolling_error_rate: 0.2
+        cooldown_seconds: 30
+        half_open_probe_requests: 2
+      stage_breakers:
+        teacher: {}
+        rubricator: {}
+        verifier: {}
+
   # Local vLLM judge served via OpenAI-compatible API.
   # Launch via training/launch_judge_vllm.sh.
   local_vllm:

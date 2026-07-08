@@ -16,28 +16,41 @@ from pathlib import Path
 from threading import BoundedSemaphore, Lock
 from typing import Any, Literal
 
+from anthropic import (
+    Anthropic,
+)
+from anthropic import (
+    APIConnectionError as AnthropicAPIConnectionError,
+)
+from anthropic import (
+    APIStatusError as AnthropicAPIStatusError,
+)
+from anthropic import (
+    APITimeoutError as AnthropicAPITimeoutError,
+)
 from dotenv import load_dotenv
 from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
+from algo.anthropic_env import apply_selected_anthropic_profile_to_environment
+from algo.openai_env import apply_selected_openai_profile_to_environment
 from algo.ropd_artifacts import BlackOPDArtifactExporter, BlackOPDExportConfig
 from algo.ropd_judge_provider_resolver import (
     BlackOPDJudgeProviderResolver,
     ResolvedJudgeProviderConfig,
     ResolvedJudgeRole,
 )
-from algo.ropd_scheduler import BlackOPDRequestSchedulerConfig, BoundedRequestScheduler
-from algo.ropd_teacher_index import (
-    OfflineTeacherIndex,
-    OfflineTeacherIndexClient,
-    build_teacher_fingerprint_payload,
-)
-from algo.openai_env import apply_selected_openai_profile_to_environment
 from algo.ropd_prompts import (
     PROMPT_TEMPLATE_VERSION,
     build_rubricator_prompt,
     build_teacher_input_messages,
     build_verifier_prompt,
+)
+from algo.ropd_scheduler import BlackOPDRequestSchedulerConfig, BoundedRequestScheduler
+from algo.ropd_teacher_index import (
+    OfflineTeacherIndex,
+    OfflineTeacherIndexClient,
+    build_teacher_fingerprint_payload,
 )
 
 RUBRIC_SCHEMA_VERSION = "ropd.rubric.v1"
@@ -46,8 +59,9 @@ REQUEST_FINGERPRINT_SCHEMA_VERSION = "ropd.request_fingerprint.v1"
 MIN_RUBRIC_CRITERIA = 4
 MAX_RUBRIC_CRITERIA = 12
 TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
-SUPPORTED_ROLE_PROVIDERS = frozenset({"openai_compatible", "static", "offline_index"})
-SUPPORTED_ROLE_API_STYLES = frozenset({"responses", "chat_completions"})
+ONLINE_ROLE_PROVIDERS = frozenset({"openai_compatible", "anthropic"})
+SUPPORTED_ROLE_PROVIDERS = ONLINE_ROLE_PROVIDERS | frozenset({"static", "offline_index"})
+SUPPORTED_ROLE_API_STYLES = frozenset({"responses", "chat_completions", "anthropic_messages"})
 ROPD_STAGES: tuple[Literal["teacher", "rubricator", "verifier"], ...] = ("teacher", "rubricator", "verifier")
 TEXT_ARTIFACT_MODES: tuple[Literal["diagnostic_only", "all_pairs"], ...] = ("diagnostic_only", "all_pairs")
 PROVIDER_METRIC_NAMES = (
@@ -433,6 +447,7 @@ def _load_repo_dotenv_into_environment() -> bool:
 def _prepare_repo_environment() -> None:
     _load_repo_dotenv_into_environment()
     apply_selected_openai_profile_to_environment()
+    apply_selected_anthropic_profile_to_environment()
 
 
 def _get_env_value(name: str) -> str | None:
@@ -458,9 +473,9 @@ def _resolve_profiled_provider_limits_config(provider_limits_config: Mapping[str
     return _merge_nested_mappings(resolved_provider_limits_config, selected_profile_override)
 
 
-def _require_api_key(api_key: str | None) -> str:
+def _require_api_key(api_key: str | None, *, provider: str = "openai_compatible") -> str:
     if api_key is None or not api_key.strip():
-        raise ValueError("ROPD OpenAI-compatible clients require a non-empty API key.")
+        raise ValueError(f"ROPD {provider} clients require a non-empty API key/auth token.")
     return api_key.strip()
 
 
@@ -575,8 +590,8 @@ def _build_role_config(
         if index_path is None:
             raise ValueError("ropd.teacher.index_path is required when teacher.provider=offline_index.")
 
-    if provider == "openai_compatible":
-        resolved_api_key = _require_api_key(api_key)
+    if provider in ONLINE_ROLE_PROVIDERS:
+        resolved_api_key = _require_api_key(api_key, provider=provider)
     else:
         resolved_api_key = api_key or ""
 
@@ -598,6 +613,12 @@ def _build_role_config(
         validation_error_retries=validation_error_retries,
         index_path=index_path,
     )
+
+
+def _teacher_fingerprint_provider(role_config: OpenAIRoleConfig) -> str:
+    if role_config.api_style == "anthropic_messages":
+        return "anthropic"
+    return "openai_compatible"
 
 
 def _role_config_from_resolved_role(role: ResolvedJudgeRole) -> OpenAIRoleConfig:
@@ -623,7 +644,7 @@ def _role_config_from_resolved_role(role: ResolvedJudgeRole) -> OpenAIRoleConfig
 
 def _select_primary_online_resolved_role(resolved_config: ResolvedJudgeProviderConfig) -> ResolvedJudgeRole:
     for role in (resolved_config.roles.teacher, resolved_config.roles.rubricator, resolved_config.roles.verifier):
-        if role.provider == "openai_compatible":
+        if role.provider in ONLINE_ROLE_PROVIDERS:
             return role
     return resolved_config.roles.teacher
 
@@ -1251,11 +1272,7 @@ class OpenAICompatibleProvider:
                 input_payload=input_payload,
                 text_format=text_format,
                 request_metadata=request_metadata,
-                request=(
-                    (lambda client: client.chat.completions.create(**request_kwargs))
-                    if role.api_style == "chat_completions"
-                    else (lambda client: client.responses.create(**request_kwargs))
-                ),
+                request=self._build_create_text_request(role=role, request_kwargs=request_kwargs),
             )
             response_metadata = self._build_response_metadata(response)
             response_status = _coerce_optional_string(response_metadata.get("status"), default=None)
@@ -1330,6 +1347,11 @@ class OpenAICompatibleProvider:
                     raise
             self._after_request_success(stage=stage)
             return resolved_output
+
+    def _build_create_text_request(self, *, role: OpenAIRoleConfig, request_kwargs: dict[str, Any]) -> Any:
+        if role.api_style == "chat_completions":
+            return lambda client: client.chat.completions.create(**request_kwargs)
+        return lambda client: client.responses.create(**request_kwargs)
 
     def _acquire_inflight_request(self, request_fingerprint: str) -> tuple[Future[Any], bool]:
         with self._shared_resources.inflight_requests_lock:
@@ -1899,6 +1921,217 @@ class OpenAICompatibleProvider:
             return client
 
 
+class AnthropicCompatibleProvider(OpenAICompatibleProvider):
+    def __init__(
+        self,
+        transport: OpenAITransportConfig,
+        *,
+        provider_limits: BlackOPDProviderLimitsConfig | None = None,
+        request_scheduler_config: BlackOPDRequestSchedulerConfig | None = None,
+        client_factory: Any = Anthropic,
+        sleep: Any = time.sleep,
+        time_fn: Any = time.monotonic,
+        uniform: Any = random.uniform,
+    ) -> None:
+        super().__init__(
+            transport,
+            provider_limits=provider_limits,
+            request_scheduler_config=request_scheduler_config,
+            client_factory=client_factory,
+            sleep=sleep,
+            time_fn=time_fn,
+            uniform=uniform,
+        )
+
+    def _build_request_kwargs(
+        self,
+        *,
+        role: OpenAIRoleConfig,
+        input_payload: Any,
+        text_format: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if role.api_style != "anthropic_messages":
+            raise BlackOPDClientError(
+                stage="teacher",
+                error_type="validation_error",
+                message="anthropic provider requires api_style='anthropic_messages'.",
+            )
+
+        messages, system_text = self._normalize_anthropic_messages(input_payload)
+        request_kwargs: dict[str, Any] = {
+            "model": role.model,
+            "messages": messages,
+            "max_tokens": role.max_output_tokens or 1024,
+        }
+        if system_text:
+            request_kwargs["system"] = system_text
+        if role.temperature is not None:
+            request_kwargs["temperature"] = role.temperature
+        if role.top_p is not None:
+            request_kwargs["top_p"] = role.top_p
+        return request_kwargs
+
+    def _build_create_text_request(self, *, role: OpenAIRoleConfig, request_kwargs: dict[str, Any]) -> Any:
+        del role
+        return lambda client: client.messages.create(**request_kwargs)
+
+    def _normalize_anthropic_messages(self, input_payload: Any) -> tuple[list[dict[str, Any]], str | None]:
+        normalized_messages = self._normalize_chat_messages(input_payload)
+        anthropic_messages: list[dict[str, Any]] = []
+        system_parts: list[str] = []
+        for message in normalized_messages:
+            role = str(message.get("role", "user")).strip().lower()
+            content = self._stringify_anthropic_content(message.get("content", ""))
+            if role == "system":
+                if content:
+                    system_parts.append(content)
+                continue
+            anthropic_messages.append(
+                {
+                    "role": "assistant" if role == "assistant" else "user",
+                    "content": content,
+                }
+            )
+        if not anthropic_messages:
+            anthropic_messages.append({"role": "user", "content": ""})
+        return anthropic_messages, "\n\n".join(system_parts) or None
+
+    def _stringify_anthropic_content(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list | tuple):
+            fragments: list[str] = []
+            for item in content:
+                if isinstance(item, Mapping):
+                    text = _coerce_optional_string(item.get("text"), default=None)
+                    if text is not None:
+                        fragments.append(text)
+                    elif item.get("type") in {"text", "input_text"}:
+                        fragments.append(self._stringify_chat_payload(item.get("content", "")))
+                    else:
+                        fragments.append(self._stringify_chat_payload(item))
+                else:
+                    fragments.append(self._stringify_chat_payload(item))
+            return "\n".join(fragment for fragment in fragments if fragment)
+        return self._stringify_chat_payload(content)
+
+    def _build_response_metadata(self, response: Any) -> dict[str, Any]:
+        content_payload = self._to_json_compatible(getattr(response, "content", None))
+        text_fragments = self._collect_text_fragments(content_payload)
+        resolved_output_text = "".join(text_fragments).strip()
+        stop_reason = self._to_json_compatible(getattr(response, "stop_reason", None))
+        response_status = "completed"
+        incomplete_details = None
+        if stop_reason == "max_tokens":
+            response_status = "incomplete"
+            incomplete_details = {"reason": "max_tokens"}
+        elif stop_reason not in (None, "end_turn", "stop_sequence"):
+            response_status = str(stop_reason)
+
+        response_metadata = {
+            "id": self._to_json_compatible(getattr(response, "id", None)),
+            "model": self._to_json_compatible(getattr(response, "model", None)),
+            "status": response_status,
+            "incomplete_details": incomplete_details,
+            "usage": self._to_json_compatible(getattr(response, "usage", None)),
+            "stop_reason": stop_reason,
+            "stop_sequence": self._to_json_compatible(getattr(response, "stop_sequence", None)),
+            "resolved_output_text": resolved_output_text or None,
+            "resolved_output_text_length": len(resolved_output_text),
+            "resolved_output_text_source": "content_text" if resolved_output_text else "none",
+            "content": content_payload,
+        }
+        return {
+            key: value
+            for key, value in response_metadata.items()
+            if value is not None and value != []
+        }
+
+    def _execute_with_retry(
+        self,
+        *,
+        stage: Literal["teacher", "rubricator", "verifier"],
+        role: OpenAIRoleConfig,
+        input_payload: Any,
+        text_format: dict[str, Any] | None,
+        request_metadata: dict[str, Any],
+        request: Any,
+    ) -> Any:
+        max_attempts = self.transport.max_retries + 1
+        last_error: BlackOPDClientError | None = None
+
+        for attempt_index in range(max_attempts):
+            try:
+                self._before_request(
+                    stage=stage,
+                    role=role,
+                    input_payload=input_payload,
+                    text_format=text_format,
+                )
+                with self._shared_resources.semaphore:
+                    response = request(self._get_client(role))
+                return response
+            except BlackOPDClientError as exc:
+                last_error = exc
+            except AnthropicAPITimeoutError as exc:
+                last_error = BlackOPDClientError(
+                    stage=stage,
+                    error_type="timeout",
+                    message=str(exc),
+                    retriable=True,
+                    details={"request": copy.deepcopy(request_metadata)},
+                )
+            except AnthropicAPIConnectionError as exc:
+                last_error = BlackOPDClientError(
+                    stage=stage,
+                    error_type="http_error",
+                    message=str(exc),
+                    retriable=True,
+                    details={"request": copy.deepcopy(request_metadata)},
+                )
+            except AnthropicAPIStatusError as exc:
+                status_code = getattr(exc, "status_code", None)
+                response = getattr(exc, "response", None)
+                retry_after_seconds = self._retry_after_seconds_from_headers(
+                    None if response is None else response.headers
+                )
+                error_details: dict[str, Any] = {"request": copy.deepcopy(request_metadata)}
+                if retry_after_seconds is not None:
+                    error_details["retry_after_seconds"] = retry_after_seconds
+                last_error = BlackOPDClientError(
+                    stage=stage,
+                    error_type="http_error",
+                    message=str(exc),
+                    status_code=status_code,
+                    retriable=status_code in TRANSIENT_HTTP_STATUS_CODES,
+                    details=error_details,
+                )
+
+            if last_error is None:
+                continue
+            self._after_request_failure(stage=stage, error=last_error)
+            if not last_error.retriable or attempt_index == max_attempts - 1:
+                raise last_error
+            self._record_metric(stage=stage, name="retries")
+            self._sleep(self._resolve_retry_delay_seconds(error=last_error, attempt_index=attempt_index))
+
+        raise last_error or RuntimeError("unreachable")
+
+    def _get_client(self, role: OpenAIRoleConfig) -> Any:
+        cache_key = (role.api_key, role.base_url, role.timeout_seconds)
+        with self._shared_resources.client_cache_lock:
+            client = self._shared_resources.client_cache.get(cache_key)
+            if client is None:
+                client = self._client_factory(
+                    auth_token=role.api_key,
+                    base_url=role.base_url,
+                    timeout=role.timeout_seconds,
+                    max_retries=0,
+                )
+                self._shared_resources.client_cache[cache_key] = client
+            return client
+
+
 def _json_schema_for_model(model: type[BaseModel], *, name: str) -> dict[str, Any]:
     return {
         "type": "json_schema",
@@ -2040,6 +2273,14 @@ class OpenAITeacherClient:
     def generate(self, raw_prompt: Any, *, uid: str | None = None) -> str:
         try:
             input_messages = build_teacher_input_messages(raw_prompt)
+            if (
+            os.getenv("ROPD_DISABLE_TEACHER_THINKING", "true").lower()
+            in ("1", "true", "yes")
+        ):
+                if input_messages and input_messages[-1]["role"] == "user":
+                    input_messages[-1]["content"] = (
+                        "/no_think\n" + str(input_messages[-1]["content"])
+                    )
         except (TypeError, ValueError) as exc:
             raise BlackOPDClientError(
                 stage="teacher",
@@ -2051,6 +2292,16 @@ class OpenAITeacherClient:
         except BlackOPDClientError as exc:
             exc.add_context(uid=uid)
             raise
+
+    def generate_many(self, raw_prompt: Any, *, uid: str | None = None, count: int | None = None) -> tuple[str, ...]:
+        resolved_count = int(1 if count is None else count)
+        if resolved_count < 1:
+            raise BlackOPDClientError(
+                stage="teacher",
+                error_type="validation_error",
+                message="teacher.generate_many count must be positive.",
+            )
+        return tuple(self.generate(raw_prompt, uid=uid) for _ in range(resolved_count))
 
 
 class OpenAIRubricatorClient:
@@ -2220,13 +2471,13 @@ def _build_role_client(
     stage: Literal["teacher", "rubricator", "verifier"],
     role_config: OpenAIRoleConfig,
     debug_config: BlackOPDDebugConfig,
-    provider: OpenAICompatibleProvider | None,
+    provider: Any | None,
 ) -> Any:
     if role_config.provider == "offline_index":
         if stage != "teacher":
             raise ValueError("offline_index is only supported for teacher.")
         fingerprint = build_teacher_fingerprint_payload(
-            provider="openai_compatible",
+            provider=_teacher_fingerprint_provider(role_config),
             model=role_config.model,
             base_url=role_config.base_url,
             reasoning_effort=role_config.reasoning_effort,
@@ -2242,9 +2493,9 @@ def _build_role_client(
         )
         return OfflineTeacherIndexClient(teacher_index=teacher_index)
 
-    if role_config.provider == "openai_compatible":
+    if role_config.provider in ONLINE_ROLE_PROVIDERS:
         if provider is None:
-            raise ValueError("OpenAI-compatible ROPD roles require an initialized provider.")
+            raise ValueError(f"{role_config.provider} ROPD roles require an initialized provider.")
         if stage == "teacher":
             return OpenAITeacherClient(provider=provider, role_config=role_config)
         if stage == "rubricator":
@@ -2269,40 +2520,48 @@ def build_ropd_pipeline(
     from algo.ropd_pipeline import BlackOPDPipeline
 
     resolved_config = config if isinstance(config, BlackOPDClientConfig) else build_ropd_client_config(config)
-    requires_openai_provider = any(
-        role.provider == "openai_compatible"
-        for role in (resolved_config.teacher, resolved_config.rubricator, resolved_config.verifier)
-    )
-    resolved_provider = (
-        provider
-        or (
-            OpenAICompatibleProvider(
+    online_providers: dict[str, Any] = {}
+    if provider is not None:
+        for role in (resolved_config.teacher, resolved_config.rubricator, resolved_config.verifier):
+            if role.provider in ONLINE_ROLE_PROVIDERS:
+                online_providers.setdefault(role.provider, provider)
+    else:
+        if any(
+            role.provider == "openai_compatible"
+            for role in (resolved_config.teacher, resolved_config.rubricator, resolved_config.verifier)
+        ):
+            online_providers["openai_compatible"] = OpenAICompatibleProvider(
                 resolved_config.transport,
                 provider_limits=resolved_config.provider_limits,
                 request_scheduler_config=resolved_config.request_scheduler,
             )
-            if requires_openai_provider
-            else None
-        )
-    )
+        if any(
+            role.provider == "anthropic"
+            for role in (resolved_config.teacher, resolved_config.rubricator, resolved_config.verifier)
+        ):
+            online_providers["anthropic"] = AnthropicCompatibleProvider(
+                resolved_config.transport,
+                provider_limits=resolved_config.provider_limits,
+                request_scheduler_config=resolved_config.request_scheduler,
+            )
     return BlackOPDPipeline(
         teacher_client=_build_role_client(
             stage="teacher",
             role_config=resolved_config.teacher,
             debug_config=resolved_config.debug,
-            provider=resolved_provider,
+            provider=online_providers.get(resolved_config.teacher.provider),
         ),
         rubric_client=_build_role_client(
             stage="rubricator",
             role_config=resolved_config.rubricator,
             debug_config=resolved_config.debug,
-            provider=resolved_provider,
+            provider=online_providers.get(resolved_config.rubricator.provider),
         ),
         verifier_client=_build_role_client(
             stage="verifier",
             role_config=resolved_config.verifier,
             debug_config=resolved_config.debug,
-            provider=resolved_provider,
+            provider=online_providers.get(resolved_config.verifier.provider),
         ),
         max_pair_concurrency=resolved_config.max_pair_concurrency,
         max_verifier_subject_concurrency=resolved_config.max_verifier_subject_concurrency,
@@ -2326,7 +2585,9 @@ __all__ = [
     "BlackOPDStructuredRubric",
     "BlackOPDVerifierScore",
     "BlackOPDExportConfig",
+    "AnthropicCompatibleProvider",
     "OpenAICompatibleProvider",
+    "ONLINE_ROLE_PROVIDERS",
     "OpenAIRoleConfig",
     "OpenAIRubricatorClient",
     "OpenAITeacherClient",
@@ -2337,5 +2598,6 @@ __all__ = [
     "TRANSIENT_HTTP_STATUS_CODES",
     "VERIFIER_SCHEMA_VERSION",
     "build_ropd_client_config",
+    "_teacher_fingerprint_provider",
     "build_ropd_pipeline",
 ]

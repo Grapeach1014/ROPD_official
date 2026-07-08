@@ -10,20 +10,22 @@ from algo.ropd.prompts import (
     build_ropd_verifier_prompt,
 )
 from algo.ropd_clients import (
+    ONLINE_ROLE_PROVIDERS,
     PROMPT_TEMPLATE_VERSION,
+    AnthropicCompatibleProvider,
     BlackOPDClientError,
     BlackOPDDebugConfig,
     BlackOPDProviderCircuitBreakerConfig,
     BlackOPDProviderLimitsConfig,
     BlackOPDRequestSchedulerConfig,
-    BlackOPDStageBreakerConfigSet,
     BlackOPDRubricCriterion,
+    BlackOPDStageBreakerConfigSet,
     BlackOPDStructuredRubric,
     BlackOPDVerifierScore,
     OpenAICompatibleProvider,
     OpenAIRoleConfig,
-    OpenAITransportConfig,
     OpenAITeacherClient,
+    OpenAITransportConfig,
     StaticTeacherClient,
     _build_circuit_breaker_config,
     _build_role_config,
@@ -33,11 +35,12 @@ from algo.ropd_clients import (
     _coerce_positive_int,
     _json_schema_for_model,
     _merge_nested_mappings,
-    _parse_structured_rubric,
     _parse_json_payload,
+    _parse_structured_rubric,
     _prepare_repo_environment,
     _resolve_profiled_provider_limits_config,
     _role_config_from_resolved_role,
+    _teacher_fingerprint_provider,
     _validate_structured_rubric,
     _validate_verifier_score,
 )
@@ -385,7 +388,7 @@ def build_ropd_judge_config(
                     resolved_provider_config.roles.rubricator,
                     resolved_provider_config.roles.verifier,
                 )
-                if role.provider == "openai_compatible"
+                if role.provider in ONLINE_ROLE_PROVIDERS
             ),
             resolved_provider_config.roles.teacher,
         )
@@ -554,7 +557,7 @@ def build_ropd_judge_config(
 def build_ropd_clients(
     config: RopdJudgeConfig | dict[str, Any] | None = None,
     *,
-    provider: OpenAICompatibleProvider | None = None,
+    provider: Any | None = None,
 ) -> tuple[
     RopdTeacherClient,
     RopdRubricatorClient,
@@ -565,21 +568,34 @@ def build_ropd_clients(
         if isinstance(config, RopdJudgeConfig)
         else build_ropd_judge_config(config)
     )
-    needs_provider = any(
-        role.provider == "openai_compatible"
-        for role in (resolved_config.teacher, resolved_config.rubricator, resolved_config.verifier)
-    )
-    resolved_provider = provider
-    if resolved_provider is None and needs_provider:
-        resolved_provider = OpenAICompatibleProvider(
-            resolved_config.transport,
-            provider_limits=resolved_config.provider_limits,
-            request_scheduler_config=resolved_config.request_scheduler,
-        )
+    online_providers: dict[str, Any] = {}
+    if provider is not None:
+        for role in (resolved_config.teacher, resolved_config.rubricator, resolved_config.verifier):
+            if role.provider in ONLINE_ROLE_PROVIDERS:
+                online_providers.setdefault(role.provider, provider)
+    else:
+        if any(
+            role.provider == "openai_compatible"
+            for role in (resolved_config.teacher, resolved_config.rubricator, resolved_config.verifier)
+        ):
+            online_providers["openai_compatible"] = OpenAICompatibleProvider(
+                resolved_config.transport,
+                provider_limits=resolved_config.provider_limits,
+                request_scheduler_config=resolved_config.request_scheduler,
+            )
+        if any(
+            role.provider == "anthropic"
+            for role in (resolved_config.teacher, resolved_config.rubricator, resolved_config.verifier)
+        ):
+            online_providers["anthropic"] = AnthropicCompatibleProvider(
+                resolved_config.transport,
+                provider_limits=resolved_config.provider_limits,
+                request_scheduler_config=resolved_config.request_scheduler,
+            )
 
     if resolved_config.teacher.provider == "offline_index":
         fingerprint = build_teacher_fingerprint_payload(
-            provider="openai_compatible",
+            provider=_teacher_fingerprint_provider(resolved_config.teacher),
             model=resolved_config.teacher.model,
             base_url=resolved_config.teacher.base_url,
             reasoning_effort=resolved_config.teacher.reasoning_effort,
@@ -594,9 +610,10 @@ def build_ropd_clients(
             expected_fingerprint=fingerprint,
         )
         teacher_client = OfflineTeacherIndexClient(teacher_index=teacher_index)
-    elif resolved_config.teacher.provider == "openai_compatible":
+    elif resolved_config.teacher.provider in ONLINE_ROLE_PROVIDERS:
+        resolved_provider = online_providers.get(resolved_config.teacher.provider)
         if resolved_provider is None:
-            raise ValueError("OpenAI provider is required for openai_compatible teacher role.")
+            raise ValueError(f"Provider is required for {resolved_config.teacher.provider} teacher role.")
         teacher_client: RopdTeacherClient = OpenAITeacherClient(
             provider=resolved_provider,
             role_config=resolved_config.teacher,
@@ -607,9 +624,10 @@ def build_ropd_clients(
             role_config=resolved_config.teacher,
         )
 
-    if resolved_config.rubricator.provider == "openai_compatible":
+    if resolved_config.rubricator.provider in ONLINE_ROLE_PROVIDERS:
+        resolved_provider = online_providers.get(resolved_config.rubricator.provider)
         if resolved_provider is None:
-            raise ValueError("OpenAI provider is required for openai_compatible rubricator role.")
+            raise ValueError(f"Provider is required for {resolved_config.rubricator.provider} rubricator role.")
         rubricator_client: RopdRubricatorClient = OpenAIRopdRubricatorClient(
             provider=resolved_provider,
             role_config=resolved_config.rubricator,
@@ -621,9 +639,10 @@ def build_ropd_clients(
             role_config=resolved_config.rubricator,
         )
 
-    if resolved_config.verifier.provider == "openai_compatible":
+    if resolved_config.verifier.provider in ONLINE_ROLE_PROVIDERS:
+        resolved_provider = online_providers.get(resolved_config.verifier.provider)
         if resolved_provider is None:
-            raise ValueError("OpenAI provider is required for openai_compatible verifier role.")
+            raise ValueError(f"Provider is required for {resolved_config.verifier.provider} verifier role.")
         verifier_client: RopdVerifierClient = OpenAIRopdVerifierClient(
             provider=resolved_provider,
             role_config=resolved_config.verifier,

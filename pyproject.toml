@@ -34,6 +34,7 @@ authors = [
 # so plain `uv sync` stays cheap and only the chosen backend gets resolved.
 dependencies = [
     "accelerate==1.12.0",
+    "anthropic>=0.116,<1",
     "codetiming==1.4.0",
     "datasets==4.4.2",
     "dill==0.4.0",
