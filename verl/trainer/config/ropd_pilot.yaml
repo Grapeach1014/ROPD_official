@@ -1,0 +1,75 @@
+# @package _global_
+#
+# Four-H100 pilot recipe for observing early ROPD learning signals. This
+# composes the official ROPD training recipe; no trainer or worker path is
+# replaced. Model, teacher index, and judge credentials remain environment
+# configured.
+
+defaults:
+  - ropd
+  - _self_
+
+max_model_len: 4096
+
+data:
+  train_files:
+    - ${oc.env:ROPD_PILOT_TRAIN_FILE,tmp/dapo-math-17k.train.teacher_index_aligned.smoke1.parquet}
+  val_files:
+    - ${oc.env:ROPD_PILOT_VAL_FILE,tmp/dapo-math-17k.train.teacher_index_aligned.smoke1.parquet}
+  train_max_samples: 800
+  val_max_samples: 64
+  train_batch_size: 8
+  max_prompt_length: 2048
+  max_response_length: 2048
+  filter_overlong_prompts: true
+  validation_shuffle: false
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 1
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+  rollout:
+    name: vllm
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.45
+    max_num_batched_tokens: 65536
+    max_model_len: ${max_model_len}
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    log_prob_micro_batch_size_per_gpu: 1
+    n: 4
+    temperature: 1.0
+    enforce_eager: false
+    val_kwargs:
+      n: 1
+      do_sample: true
+      temperature: 1.0
+
+reward_model:
+  reward_kwargs:
+    ropd:
+      teacher_answer_count: 4
+      max_concurrency: 4
+      provider_limits:
+        max_concurrent_requests: 8
+      transport:
+        max_in_flight_requests: 8
+      debug:
+        output_dir: ${oc.env:ROPD_PILOT_DEBUG_DIR,outputs/${trainer.experiment_name}/reward_debug}
+
+trainer:
+  project_name: ROPD-pilot
+  group_name: ropd-pilot-4gpu
+  experiment_name: ${oc.env:EXPERIMENT,ropd-pilot-4gpu}
+  logger: [console]
+  total_epochs: 1
+  total_training_steps: 300
+  val_before_train: false
+  test_freq: -1
+  save_freq: 50
+  default_local_dir: ${oc.env:ROPD_PILOT_CKPT_DIR,checkpoints/${trainer.experiment_name}}
+  n_gpus_per_node: 4
+  nnodes: 1
+  max_actor_ckpt_to_keep: 3

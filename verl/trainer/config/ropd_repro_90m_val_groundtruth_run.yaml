@@ -1,0 +1,11 @@
+# @package _global_
+#
+# Runtime companion for ground-truth validation. VERL constructs a train
+# dataloader even in val_only mode, so it needs one full training-size batch.
+
+defaults:
+  - ropd_repro_90m_val_groundtruth
+  - _self_
+
+data:
+  train_max_samples: 16

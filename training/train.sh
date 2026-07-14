@@ -47,10 +47,21 @@ export ROPD_VLLM_BASE_URL="${ROPD_VLLM_BASE_URL:-http://127.0.0.1:18080/v1}"
 export ROPD_VLLM_MODEL="${ROPD_VLLM_MODEL:-Qwen3-30B-A3B-Instruct-2507}"
 export ROPD_VLLM_API_KEY="${ROPD_VLLM_API_KEY:-EMPTY}"
 
-cmd=(
-    uv run --no-sync python -m verl.trainer.main_ppo
-    --config-name ropd
-)
+if command -v uv >/dev/null 2>&1; then
+    # Respect an explicitly activated environment (for example .venv-b300).
+    # Without --active, uv ignores VIRTUAL_ENV when it differs from the
+    # project's default .venv and emits a warning.
+    if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+        cmd=(uv run --active --no-sync python -m verl.trainer.main_ppo --config-name ropd)
+    else
+        cmd=(uv run --no-sync python -m verl.trainer.main_ppo --config-name ropd)
+    fi
+elif [[ -x "$PROJECT_ROOT/.venv/bin/python" ]]; then
+    cmd=("$PROJECT_ROOT/.venv/bin/python" -m verl.trainer.main_ppo --config-name ropd)
+else
+    echo "Neither uv nor $PROJECT_ROOT/.venv/bin/python was found." >&2
+    exit 127
+fi
 
 if (($# > 0)); then
     cmd+=("$@")

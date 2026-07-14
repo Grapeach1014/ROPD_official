@@ -1,0 +1,77 @@
+# @package _global_
+#
+# Four-H100 observation run.  This stays on the normal ROPD/FSDP/vLLM/Ray
+# training path and is sized to expose early non-zero reward signals quickly.
+
+defaults:
+  - ropd
+  - _self_
+
+max_model_len: 6144
+
+data:
+  train_files:
+    - ${oc.env:ROPD_OBSERVE_TRAIN_FILE,tmp/dapo-math-17k.train.teacher_index_aligned.smoke1.parquet}
+  val_files:
+    - ${oc.env:ROPD_OBSERVE_VAL_FILE,tmp/dapo-math-17k.train.teacher_index_aligned.smoke1.parquet}
+  # Two batches x eight prompts; no validation is run in this observation job.
+  train_max_samples: 32
+  val_max_samples: 1
+  train_batch_size: 8
+  max_prompt_length: 2048
+  max_response_length: 4096
+  filter_overlong_prompts: true
+  validation_shuffle: false
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 1
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+  rollout:
+    name: vllm
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.45
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    max_model_len: ${max_model_len}
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    log_prob_micro_batch_size_per_gpu: 1
+    n: 4
+    # Four stochastic samples per problem make score variation observable.
+    temperature: 0.7
+    enforce_eager: false
+    val_kwargs:
+      n: 1
+      do_sample: true
+      temperature: 0.7
+
+reward_model:
+  reward_kwargs:
+    ropd:
+      teacher_answer_count: 4
+      max_concurrency: 4
+      provider_limits:
+        max_concurrent_requests: 8
+      transport:
+        max_in_flight_requests: 8
+      debug:
+        output_dir: ${oc.env:ROPD_OBSERVE_DEBUG_DIR,outputs/${trainer.experiment_name}/reward_debug}
+
+trainer:
+  project_name: ROPD-observe
+  group_name: ropd-observe-4gpu
+  experiment_name: ${oc.env:EXPERIMENT,ropd-observe-4gpu}
+  logger: [console]
+  total_epochs: 1
+  # 2 steps x 8 prompts x 4 rollouts = 64 judged student answers.
+  total_training_steps: 2
+  val_before_train: false
+  test_freq: -1
+  save_freq: 1
+  default_local_dir: ${oc.env:ROPD_OBSERVE_CKPT_DIR,checkpoints/${trainer.experiment_name}}
+  n_gpus_per_node: 4
+  nnodes: 1
+  max_actor_ckpt_to_keep: 2

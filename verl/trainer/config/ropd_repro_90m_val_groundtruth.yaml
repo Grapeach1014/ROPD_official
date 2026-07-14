@@ -1,0 +1,12 @@
+# @package _global_
+#
+# Ground-truth-only validation. `null` is intentional: an empty mapping would
+# merge with the parent ROPD mapping and retain its `ropd` key.
+
+defaults:
+  - ropd_repro_90m_val
+  - _self_
+
+reward_model:
+  reward_kwargs: null
+  val_reward_kwargs: null

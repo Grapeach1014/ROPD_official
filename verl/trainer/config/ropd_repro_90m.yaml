@@ -1,0 +1,107 @@
+# @package _global_
+#
+# A four-H100, ~90-minute *pilot reproduction* of ROPD's math track.
+#
+# This composes the official `ropd` recipe rather than introducing a separate
+# trainer.  It deliberately reduces the paper's batch=32, n=8 configuration
+# to batch=16, n=4 so that one complete epoch of the local 400-prompt training
+# split produces 1,600 on-policy responses in a practical time budget.
+#
+# Required environment variables are intentionally kept out of this file:
+#   ROPD_MODEL_PATH              absolute local Qwen3-4B path
+#   ROPD_TEACHER_INDEX_PATH      teacher_index_train.jsonl for this run
+#   ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL and role/provider variables
+
+defaults:
+  - ropd
+  - _self_
+
+# 2,048 prompt tokens + 4,096 generated tokens; leave a small safety margin.
+max_model_len: 6144
+
+data:
+  # These are the leakage-safe UID/prompt-hash splits prepared under data/math.
+  # No validation is run inside the training job (test_freq: -1), because the
+  # training teacher index contains only train UIDs.  Evaluate saved
+  # checkpoints in a separate process with teacher_index_val.jsonl.
+  train_files:
+    - ${oc.env:ROPD_REPRO_TRAIN_FILE,data/math/train.parquet}
+  val_files:
+    - ${oc.env:ROPD_REPRO_VAL_FILE,data/math/val.parquet}
+  train_max_samples: 400
+  val_max_samples: 50
+  train_batch_size: 16
+  max_prompt_length: 2048
+  max_response_length: 4096
+  filter_overlong_prompts: true
+  validation_shuffle: false
+
+actor_rollout_ref:
+  actor:
+    # Proven to fit on the four H100s in the prior 10-step run.
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size_per_gpu: 2
+    optim:
+      # Matches the paper.
+      lr: 1.0e-6
+      lr_scheduler_type: cosine
+      # The paper uses 100 warmup steps; a 25-step pilot cannot support that.
+      # A one-step warmup avoids an all-warmup run while retaining a gentle start.
+      lr_warmup_steps: 1
+      betas: [0.9, 0.95]
+      weight_decay: 0.1
+  ref:
+    log_prob_micro_batch_size_per_gpu: 2
+  rollout:
+    name: vllm
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.50
+    max_num_batched_tokens: 65536
+    max_num_seqs: 128
+    max_model_len: ${max_model_len}
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    log_prob_micro_batch_size_per_gpu: 2
+    # Paper value is n=8.  n=4 retains group-relative GRPO while fitting the
+    # 90-minute budget: 25 x 16 x 4 = 1,600 judged student responses.
+    n: 4
+    temperature: 1.0
+    top_p: 0.95
+    enforce_eager: false
+    val_kwargs:
+      n: 1
+      do_sample: true
+      temperature: 1.0
+      top_p: 0.95
+
+reward_model:
+  reward_kwargs:
+    ropd:
+      # Matches the paper's m=4 offline teacher references per prompt.
+      teacher_answer_count: 4
+      # Kept below the earlier 8-way setting that triggered provider circuit
+      # breakers.  The external judge, not GPU memory, is the time bottleneck.
+      max_concurrency: 4
+      provider_limits:
+        max_concurrent_requests: 8
+      transport:
+        max_in_flight_requests: 8
+      debug:
+        output_dir: ${oc.env:ROPD_REPRO_DEBUG_DIR,outputs/${trainer.experiment_name}/reward_debug}
+
+trainer:
+  project_name: ROPD-repro-90m
+  group_name: ropd-repro-90m-4gpu
+  experiment_name: ${oc.env:EXPERIMENT,ropd-repro-90m-4gpu}
+  logger: [console]
+  total_epochs: 1
+  # Exactly one pass through 400 train prompts at batch size 16.
+  total_training_steps: 25
+  val_before_train: false
+  test_freq: -1
+  # Selection candidates: steps 5, 10, 15, 20 and 25.
+  save_freq: 5
+  default_local_dir: ${oc.env:ROPD_REPRO_CKPT_DIR,checkpoints/${trainer.experiment_name}}
+  n_gpus_per_node: 4
+  nnodes: 1
+  max_actor_ckpt_to_keep: 6

@@ -15,7 +15,9 @@ from functools import cache
 from pathlib import Path
 from threading import BoundedSemaphore, Lock
 from typing import Any, Literal
+from types import SimpleNamespace
 
+import httpx
 from anthropic import (
     Anthropic,
 )
@@ -1961,8 +1963,15 @@ class AnthropicCompatibleProvider(OpenAICompatibleProvider):
         request_kwargs: dict[str, Any] = {
             "model": role.model,
             "messages": messages,
-            "max_tokens": role.max_output_tokens or 1024,
         }
+        # The internal gateway exposes GPT models through its Anthropic-style
+        # /messages endpoint, but follows the OpenAI naming for this field.
+        # Keep native Anthropic requests unchanged and only translate for the
+        # GPT route; this lets one profile serve both model families.
+        if role.model.strip().lower().startswith("gpt-"):
+            request_kwargs["max_completion_tokens"] = role.max_output_tokens or 1024
+        else:
+            request_kwargs["max_tokens"] = role.max_output_tokens or 1024
         if system_text:
             request_kwargs["system"] = system_text
         if role.temperature is not None:
@@ -1972,8 +1981,47 @@ class AnthropicCompatibleProvider(OpenAICompatibleProvider):
         return request_kwargs
 
     def _build_create_text_request(self, *, role: OpenAIRoleConfig, request_kwargs: dict[str, Any]) -> Any:
-        del role
+        if role.model.strip().lower().startswith("gpt-"):
+            return lambda _client: self._create_gpt_messages_request(role=role, request_kwargs=request_kwargs)
         return lambda client: client.messages.create(**request_kwargs)
+
+    @staticmethod
+    def _create_gpt_messages_request(*, role: OpenAIRoleConfig, request_kwargs: dict[str, Any]) -> Any:
+        """Call the gateway's Anthropic-compatible GPT route without the SDK.
+
+        The Anthropic SDK requires ``max_tokens`` and therefore cannot express
+        the gateway's GPT-only ``max_completion_tokens`` request shape.
+        Normalize the small common response subset back to the SDK-like object
+        consumed by ``_build_response_metadata``.
+        """
+        base_url = (role.base_url or "").rstrip("/")
+        if not base_url:
+            raise ValueError("anthropic GPT route requires a non-empty base_url")
+        response = httpx.post(
+            f"{base_url}/messages",
+            headers={
+                "x-api-key": role.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=request_kwargs,
+            timeout=role.timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        stop_reason = payload.get("stop_reason")
+        # OpenAI-style gateways commonly return "stop"; the surrounding
+        # Anthropic response parser recognizes "end_turn" as completed.
+        if stop_reason == "stop":
+            stop_reason = "end_turn"
+        return SimpleNamespace(
+            id=payload.get("id"),
+            model=payload.get("model"),
+            content=payload.get("content") or [],
+            usage=payload.get("usage"),
+            stop_reason=stop_reason,
+            stop_sequence=payload.get("stop_sequence"),
+        )
 
     def _normalize_anthropic_messages(self, input_payload: Any) -> tuple[list[dict[str, Any]], str | None]:
         normalized_messages = self._normalize_chat_messages(input_payload)
@@ -2105,6 +2153,36 @@ class AnthropicCompatibleProvider(OpenAICompatibleProvider):
                     status_code=status_code,
                     retriable=status_code in TRANSIENT_HTTP_STATUS_CODES,
                     details=error_details,
+                )
+            except httpx.TimeoutException as exc:
+                last_error = BlackOPDClientError(
+                    stage=stage,
+                    error_type="timeout",
+                    message=str(exc),
+                    retriable=True,
+                    details={"request": copy.deepcopy(request_metadata)},
+                )
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code
+                retry_after_seconds = self._retry_after_seconds_from_headers(exc.response.headers)
+                error_details = {"request": copy.deepcopy(request_metadata)}
+                if retry_after_seconds is not None:
+                    error_details["retry_after_seconds"] = retry_after_seconds
+                last_error = BlackOPDClientError(
+                    stage=stage,
+                    error_type="http_error",
+                    message=str(exc),
+                    status_code=status_code,
+                    retriable=status_code in TRANSIENT_HTTP_STATUS_CODES,
+                    details=error_details,
+                )
+            except httpx.HTTPError as exc:
+                last_error = BlackOPDClientError(
+                    stage=stage,
+                    error_type="http_error",
+                    message=str(exc),
+                    retriable=True,
+                    details={"request": copy.deepcopy(request_metadata)},
                 )
 
             if last_error is None:

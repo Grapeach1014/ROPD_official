@@ -1,0 +1,76 @@
+# @package _global_
+#
+# Four-H100, 10-step throughput-oriented ROPD run. It composes the official
+# training recipe; only resource and workload knobs are overridden.
+
+defaults:
+  - ropd
+  - _self_
+
+max_model_len: 6144
+
+data:
+  train_files:
+    - ${oc.env:ROPD_GPU10_TRAIN_FILE,tmp/dapo-math-17k.train.teacher_index_aligned.smoke1.parquet}
+  val_files:
+    - ${oc.env:ROPD_GPU10_VAL_FILE,tmp/dapo-math-17k.train.teacher_index_aligned.smoke1.parquet}
+  # 10 steps x 16 prompts. Each prompt receives four Student rollouts.
+  train_max_samples: 160
+  val_max_samples: 1
+  train_batch_size: 16
+  max_prompt_length: 2048
+  max_response_length: 4096
+  filter_overlong_prompts: true
+  validation_shuffle: false
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size_per_gpu: 2
+  ref:
+    log_prob_micro_batch_size_per_gpu: 2
+  rollout:
+    name: vllm
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.50
+    max_num_batched_tokens: 65536
+    max_num_seqs: 128
+    max_model_len: ${max_model_len}
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    log_prob_micro_batch_size_per_gpu: 2
+    n: 4
+    temperature: 0.7
+    enforce_eager: false
+    val_kwargs:
+      n: 1
+      do_sample: true
+      temperature: 0.7
+
+reward_model:
+  reward_kwargs:
+    ropd:
+      teacher_answer_count: 4
+      max_concurrency: 8
+      provider_limits:
+        max_concurrent_requests: 16
+      transport:
+        max_in_flight_requests: 16
+      debug:
+        output_dir: ${oc.env:ROPD_GPU10_DEBUG_DIR,outputs/${trainer.experiment_name}/reward_debug}
+
+trainer:
+  project_name: ROPD-gpu10
+  group_name: ropd-gpu10-4gpu
+  experiment_name: ${oc.env:EXPERIMENT,ropd-gpu10-4gpu}
+  logger: [console]
+  total_epochs: 1
+  total_training_steps: 10
+  val_before_train: false
+  test_freq: -1
+  # Checkpointing writes tens of GB; save twice rather than after every step.
+  save_freq: 5
+  default_local_dir: ${oc.env:ROPD_GPU10_CKPT_DIR,checkpoints/${trainer.experiment_name}}
+  n_gpus_per_node: 4
+  nnodes: 1
+  max_actor_ckpt_to_keep: 2

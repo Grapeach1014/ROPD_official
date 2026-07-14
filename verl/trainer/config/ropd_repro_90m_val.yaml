@@ -1,0 +1,58 @@
+# @package _global_
+#
+# Offline validation companion for `ropd_repro_90m`.
+# It deliberately uses VERL's PPO `val_only` path rather than the ROPD reward
+# manager: each generated answer is compared with reward_model.ground_truth.
+
+defaults:
+  - ropd_repro_90m
+  - _self_
+
+data:
+  # `fit()` constructs both loaders before it observes val_only.  The train
+  # loader is therefore harmlessly pointed at the same held-out split and is
+  # never consumed.
+  train_files:
+    - ${oc.env:ROPD_EVAL_VAL_FILE,data/math/val.parquet}
+  val_files:
+    - ${oc.env:ROPD_EVAL_VAL_FILE,data/math/val.parquet}
+  train_max_samples: 1
+  val_max_samples: 50
+  validation_shuffle: false
+
+# Do not instantiate the ROPD Teacher/Rubricator/Verifier during validation.
+# The project-provided naive manager calls the math ground-truth scorer.
+reward_manager:
+  source: register
+  name: naive
+  module: null
+
+val_reward_manager:
+  source: register
+  name: naive
+
+actor_rollout_ref:
+  rollout:
+    # Four stochastic samples are a practical pilot analogue of the paper's
+    # k=16 evaluation. Metrics include both mean@4 and best@4.
+    n: 4
+    temperature: 1.0
+    top_p: 0.95
+    val_kwargs:
+      n: 4
+      do_sample: true
+      temperature: 1.0
+      top_p: 0.95
+
+trainer:
+  val_only: true
+  val_before_train: true
+  test_freq: -1
+  logger: [console]
+  log_val_generations: 0
+  # The runner supplies a unique metrics and generations directory for every
+  # candidate through Hydra command-line overrides.
+  validation_metrics_path: null
+  validation_data_dir: null
+  n_gpus_per_node: 4
+  nnodes: 1

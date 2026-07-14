@@ -1,0 +1,93 @@
+# @package _global_
+#
+# One-step, four-GPU ROPD integration smoke test.  This composes the normal
+# `ropd` recipe and only reduces scale; it does not replace the PPO/Ray/FSDP/
+# vLLM/reward implementation.
+#
+# Required environment variables are intentionally not stored here:
+#   ROPD_MODEL_PATH, ROPD_TEACHER_INDEX_PATH,
+#   ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL,
+#   ROPD_{TEACHER,RUBRICATOR,VERIFIER}_{PROFILE,MODEL}.
+
+defaults:
+  - ropd
+  - _self_
+
+max_model_len: 768
+
+data:
+  # This parquet is supplied with the repository and has uid + prompt hashes
+  # aligned to tmp/opus_teacher_index_math100_n4.jsonl.
+  train_files:
+    - ${oc.env:ROPD_SMOKE_TRAIN_FILE,tmp/dapo-math-17k.train.teacher_index_aligned.smoke1.parquet}
+  val_files:
+    - ${oc.env:ROPD_SMOKE_VAL_FILE,tmp/dapo-math-17k.train.teacher_index_aligned.smoke1.parquet}
+  train_max_samples: 4
+  val_max_samples: 1
+  train_batch_size: 4
+  max_prompt_length: 512
+  max_response_length: 256
+  filter_overlong_prompts: true
+  validation_shuffle: false
+
+actor_rollout_ref:
+  actor:
+    # Four prompts are trained as one FSDP data-parallel batch, one sample per
+    # GPU.  Two rollouts per prompt preserve the GRPO group operation.
+    ppo_mini_batch_size: 4
+    ppo_micro_batch_size_per_gpu: 1
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+  rollout:
+    name: vllm
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.40
+    max_num_batched_tokens: 2048
+    max_model_len: ${max_model_len}
+    prompt_length: ${data.max_prompt_length}
+    response_length: ${data.max_response_length}
+    log_prob_micro_batch_size_per_gpu: 1
+    n: 2
+    temperature: 1.0
+    enforce_eager: true
+    val_kwargs:
+      n: 1
+      do_sample: true
+      temperature: 1.0
+
+reward_model:
+  reward_kwargs:
+    ropd:
+      # The supplied index contains four answers per prompt; using one keeps
+      # the online rubric/verifier request small while still exercising lookup.
+      teacher_answer_count: 1
+      max_concurrency: 1
+      provider_resolution:
+        overrides:
+          global: {}
+          teacher:
+            # Must match the index fingerprint generated with Claude.
+            timeout_seconds: 480
+          rubricator:
+            timeout_seconds: 120
+            max_output_tokens: 1024
+          verifier:
+            timeout_seconds: 60
+            max_output_tokens: 1024
+      debug:
+        output_dir: ${oc.env:ROPD_SMOKE_DEBUG_DIR,outputs/ropd_smoke/reward_debug}
+
+trainer:
+  project_name: ROPD-smoke
+  group_name: ropd-smoke
+  experiment_name: ${oc.env:EXPERIMENT,ropd-smoke}
+  logger: [console]
+  total_epochs: 1
+  total_training_steps: 1
+  val_before_train: false
+  test_freq: -1
+  save_freq: -1
+  default_local_dir: ${oc.env:ROPD_CKPT_DIR,checkpoints/ropd}/smoke/${trainer.experiment_name}
+  n_gpus_per_node: 4
+  nnodes: 1
+  max_actor_ckpt_to_keep: 1

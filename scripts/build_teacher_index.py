@@ -432,6 +432,7 @@ def _generate_missing_records(
     output_path: Path,
     failure_path: Path,
     progress: bool,
+    inter_batch_delay_seconds: float,
 ) -> BuildResult:
     generated_count = 0
     failed_count = 0
@@ -463,6 +464,8 @@ def _generate_missing_records(
                 generated_count += result.generated_count
                 failed_count += result.failed_count
                 records = []
+                if inter_batch_delay_seconds > 0:
+                    time.sleep(inter_batch_delay_seconds)
 
             if records:
                 result = _process_record_batch(
@@ -522,6 +525,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=4,
         help="Maximum concurrent dataset records to generate.",
     )
+    parser.add_argument(
+        "--inter-batch-delay-seconds",
+        type=float,
+        default=0.0,
+        help="Sleep after each submitted batch to pace a rate-limited teacher API.",
+    )
     parser.add_argument("--prompt-key", default="prompt", help="Dataset prompt column name.")
     parser.add_argument(
         "--config",
@@ -535,6 +544,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.inter_batch_delay_seconds < 0:
+        raise ValueError("--inter-batch-delay-seconds must be >= 0")
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -639,6 +650,7 @@ def main(argv: list[str] | None = None) -> int:
             output_path=output_path,
             failure_path=failure_path,
             progress=progress_enabled,
+            inter_batch_delay_seconds=args.inter_batch_delay_seconds,
         )
     except KeyboardInterrupt:
         logger.warning("Interrupted. Completed rows already flushed to %s; rerun with --resume.", output_path)

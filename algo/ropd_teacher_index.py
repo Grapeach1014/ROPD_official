@@ -127,7 +127,10 @@ class OfflineTeacherIndex:
             )
             if hash_teacher_fingerprint(record.teacher_fingerprint) != expected_digest:
                 raise BlackOPDTeacherIndexError(
-                    f"Offline teacher index teacher fingerprint mismatch at {path}:{line_number}."
+                    "Offline teacher index teacher fingerprint mismatch "
+                    f"at {path}:{line_number}. "
+                    f"Expected={dict(expected_fingerprint)!r}; "
+                    f"found={record.teacher_fingerprint!r}."
                 )
 
             key = (record.uid, record.raw_prompt_hash)
